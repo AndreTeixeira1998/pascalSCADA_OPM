@@ -284,19 +284,6 @@ begin
   ReconnectStarted:=now;
   while not Terminated do begin
     while FMessageQueue.PeekMessage(msg,0,100,true) do begin
-      // we have to check if the thread is beeing terminated
-      //   if so, we can only close the socket and exit
-      //   no more messagehandling is possible, because the thread will be
-      //   destroyed soon.
-      //   If we are to slow a possible memoryleak is possible, because the
-      //   thread is killed by the rest of programm without freeing his resources
-      if Terminated then begin
-        FActive:=false;
-        if Assigned(DisconnectSocket) then
-          DisconnectSocket(Ok);
-        ReconnectTimerRunning:=false;
-        break;  // -->>af  fast exit
-      end;
       Ok:=false;
       case msg.MsgID of
         0: begin
