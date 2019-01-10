@@ -66,20 +66,18 @@ type
   @value(ptDouble    Float, 64 bits sized.)
   }
   {$ENDIF}
-  TProtocolTagType = (
-                   ptBit,
-                   ptShortInt,
-                   ptByte,
-                   ptSmallInt,
-                   ptWord,
-                   ptLongInt,
-                   ptDWord,
-                   ptFloat,
-                   ptInt64,
-                   ptQWord,
-                   ptDouble
-                  );
-
+  TProtocolTagType = (ptBit,
+                      ptShortInt,
+                      ptByte,
+                      ptSmallInt,
+                      ptWord,
+                      ptLongInt,
+                      ptDWord,
+                      ptFloat,
+                      ptInt64,
+                      ptQWord,
+                      ptDouble
+                     );
 
   {$IFDEF PORTUGUES}
   //: Adiciona um tag no editor de formulário do Delphi/Lazarus.
@@ -164,14 +162,13 @@ type
   @member ValueTimeStamp Date/time when the values was written.
   }
   {$ENDIF}
-  TScanWriteRec = record
-    SWID:Cardinal;
+  TScanReqRec = record
     Tag:TTagRec;
-    ValuesToWrite:TArrayOfDouble;
-    WriteResult:TProtocolIOResult;
+    Values:TArrayOfDouble;
+    RequestResult:TProtocolIOResult;
     ValueTimeStamp:TDateTime;
   end;
-  PScanWriteRec = ^TScanWriteRec;
+  PScanReqRec = ^TScanReqRec;
 
   {$IFDEF PORTUGUES}
   {:
@@ -189,6 +186,23 @@ type
   }
   {$ENDIF}
   TScanWriteProc = function(const Tag:TTagRec; const values:TArrayOfDouble):TProtocolIOResult of object;
+
+  {$IFDEF PORTUGUES}
+  {:
+  Define a função responsável por executar uma leitura por Scan.
+  @param(Tag TTagRec: estrutura que contem as informações do tag que vai ser lido.)
+  @param(values TArrayOfDouble: Array com os valores lidos.)
+  @returns(Todos os possíveis retornos estão definidos em TProtocolIOResult.)
+  }
+  {$ELSE}
+  {:
+  Defines the function that will execute a write by scan (asynchronous)
+  @param(Tag TTagRec: structure with informations about the tag.)
+  @param(values TArrayOfDouble: Array of values to be written.)
+  @returns(See TProtocolIOResult.)
+  }
+  {$ENDIF}
+  TSingleScanReadProc = function(var Tag:TTagRec; var values:TArrayOfDouble):TProtocolIOResult of object;
 
   {$IFDEF PORTUGUES}
   //: Ponteiro para uma função de escrita por Scan.
@@ -388,6 +402,18 @@ type
 
 const
 
+  ProtocolTagTypeSizeInBits:array[low(TProtocolTagType)..high(TProtocolTagType)] of integer = (1,
+                                                                                               8,
+                                                                                               8,
+                                                                                               16,
+                                                                                               16,
+                                                                                               32,
+                                                                                               32,
+                                                                                               32,
+                                                                                               64,
+                                                                                               64,
+                                                                                               64);
+
   {$IFDEF PORTUGUES}
   //: Constante de mensagem para leitura de tag por scan.
   {$ELSE}
@@ -401,6 +427,13 @@ const
   //: Identifies a message that does a scan write.
   {$ENDIF}
   PSM_TAGSCANWRITE =  205;
+
+  {$IFDEF PORTUGUES}
+  //: Constante de mensagem para escrita de valores de tags por scan
+  {$ELSE}
+  //: Identifies a message that does a scan write.
+  {$ENDIF}
+  PSM_SINGLESCANREAD =  206;
 
 implementation
 

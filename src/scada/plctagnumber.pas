@@ -51,14 +51,14 @@ type
     //: @seealso(TPLCNumber.SetValueRaw)
     procedure SetValueRaw(aValue:Double); override;
     //: @seealso(TPLCTag.TagCommandCallBack)
-    procedure TagCommandCallBack(Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt); override;
+    procedure TagCommandCallBack(const ReqID:LongWord; Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt); override;
     //: @seealso(TTag.Size)
     property Size nodefault;
   public
     //: @seealso(TPLCTag.ScanRead)
-    procedure ScanRead; override;
+    function ScanRead:Int64; override;
     //: @seealso(TPLCTag.ScanWrite)
-    procedure ScanWrite(Values:TArrayOfDouble; Count, Offset:Cardinal); override;
+    function ScanWrite(Values:TArrayOfDouble; Count, Offset:Cardinal; const IgnoreAutoWrite:Boolean = false):Int64; override;
     //: @seealso(TPLCTag.Read)
     procedure Read; override;
     //: @seealso(TPLCTag.Write)
@@ -132,6 +132,9 @@ type
     property MinValue;
     //: @seealso(TTag.OnUpdate)
     property OnUpdate;
+
+    property LastScanReadReqID;
+    property LastScanWriteReqID;
   end;
 
 implementation
@@ -205,34 +208,43 @@ begin
   SetLength(towrite,0);
 end;
 
-procedure TPLCTagNumber.ScanRead;
+function TPLCTagNumber.ScanRead: Int64;
 var
   tr:TTagRec;
 begin
   inherited ScanRead;
-  if (PProtocolDriver<>nil) and PAutoRead then begin
+  if (PProtocolDriver<>nil) then begin
     BuildTagRec(tr,0,0);
-    PProtocolDriver.ScanRead(tr);
-  end;
+    Result := PProtocolDriver.SingleScanRead(tr);
+  end else
+    Result:=-1;
 end;
 
-procedure TPLCTagNumber.ScanWrite(Values:TArrayOfDouble; Count, Offset:Cardinal);
+function TPLCTagNumber.ScanWrite(Values: TArrayOfDouble; Count,
+  Offset: Cardinal; const IgnoreAutoWrite: Boolean): Int64;
 var
   tr:TTagRec;
   PlcValues:TArrayOfDouble;
 begin
   PlcValues:=TagValuesToPLCValues(Values, Offset);
-  if (PProtocolDriver<>nil) then begin
-     if PAutoWrite then begin
-       BuildTagRec(tr,0,0);
-       PProtocolDriver.ScanWrite(tr,PlcValues);
-     end else begin
-       TagCommandCallBack(PlcValues,CrossNow,tcScanWrite,ioOk,0);
-       Dec(PCommWriteOk);
-     end;
-  end else
-     TagCommandCallBack(PlcValues, CrossNow, tcScanWrite, ioNullDriver, Offset);
-  SetLength(PlcValues,0);
+  try
+    if (PProtocolDriver<>nil) then begin
+      if PAutoWrite or IgnoreAutoWrite then begin
+        BuildTagRec(tr,0,0);
+        Result:=PProtocolDriver.ScanWrite(tr,PlcValues);
+      end else begin
+        TagCommandCallBack(0, PlcValues,CrossNow,tcScanWrite,ioOk,0);
+        Dec(PCommWriteOk);
+        Result:=-1;
+      end;
+    end else begin
+      TagCommandCallBack(0, PlcValues, CrossNow, tcScanWrite, ioNullDriver, Offset);
+      Result:=-1;
+    end;
+
+  finally
+    SetLength(PlcValues,0);
+  end;
 end;
 
 procedure TPLCTagNumber.Read;
@@ -255,7 +267,7 @@ begin
     BuildTagRec(tr,0,0);
     PProtocolDriver.Write(tr,PlcValues);
   end else
-     TagCommandCallBack(PlcValues, CrossNow, tcWrite, ioNullDriver, Offset);
+     TagCommandCallBack(0, PlcValues, CrossNow, tcWrite, ioNullDriver, Offset);
   SetLength(PlcValues,0);
 end;
 
@@ -272,7 +284,9 @@ begin
   end;
 end;
 
-procedure TPLCTagNumber.TagCommandCallBack(Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt);
+procedure TPLCTagNumber.TagCommandCallBack(const ReqID: LongWord;
+  Values: TArrayOfDouble; ValuesTimeStamp: TDateTime; TagCommand: TTagCommand;
+  LastResult: TProtocolIOResult; Offset: LongInt);
 var
   notify:Boolean;
   TagValues:TArrayOfDouble;
@@ -280,18 +294,22 @@ var
 begin
   PreviousTimestamp:=PValueTimeStamp;
   if (csDestroying in ComponentState) then exit;
-  inherited TagCommandCallBack(Values, ValuesTimeStamp, TagCommand, LastResult, Offset);
+  inherited TagCommandCallBack(ReqID, Values, ValuesTimeStamp, TagCommand, LastResult, Offset);
   TagValues:=PLCValuesToTagValues(Values, Offset);
 
   try
     notify := false;
     case TagCommand of
-      tcScanRead,tcRead,tcInternalUpdate:
+      tcScanRead,
+      tcRead,
+      tcInternalUpdate,
+      tcSingleScanRead:
       begin
+        PValueTimeStamp := ValuesTimeStamp;
+
         if (Length(TagValues)>0) and (LastResult in [ioOk, ioNullDriver]) then begin
           notify := (PValueRaw<>TagValues[0]) OR (IsNan(TagValues[0]) and (not IsNaN(PValueRaw)));
           PValueRaw := TagValues[0];
-          PValueTimeStamp := ValuesTimeStamp;
           if (TagCommand<>tcInternalUpdate) AND (LastResult=ioOk) then begin
             PModified:=False;
             IncCommReadOK(1);
@@ -304,6 +322,7 @@ begin
       end;
       tcScanWrite,tcWrite:
       begin
+        PValueTimeStamp := ValuesTimeStamp;
         if (Length(TagValues)>0) and (LastResult in [ioOk, ioNullDriver]) then begin
           if LastResult=ioOk then begin
             PModified:=False;
@@ -317,7 +336,7 @@ begin
     end;
 
     case TagCommand of
-      tcScanRead:
+      tcScanRead, tcSingleScanRead:
         PLastASyncReadCmdResult := LastResult;
       tcScanWrite:
         PLastASyncWriteCmdResult := LastResult;
@@ -328,11 +347,11 @@ begin
     end;
 
     if notify or PFirstUpdate then begin
-      if TagCommand in [tcRead,tcScanRead] then PFirstUpdate:=false;
+      if (TagCommand in [tcRead,tcScanRead,tcSingleScanRead]) or (ProtocolDriver=nil) then PFirstUpdate:=false;
       NotifyChange;
     end;
 
-    if (TagCommand in [tcRead,tcScanRead]) and (LastResult=ioOk) and (PreviousTimestamp<>PValueTimeStamp) then
+    if (TagCommand in [tcRead,tcScanRead, tcSingleScanRead]) and (LastResult=ioOk) and (PreviousTimestamp<>PValueTimeStamp) then
       NotifyUpdate;
   finally
     SetLength(TagValues,0);

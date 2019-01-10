@@ -127,10 +127,13 @@ type
     //procedure called to update values of multiples tag (single or block)
     function  GetMultipleValues(var MultiValues:TArrayOfScanUpdateRec):LongInt;
 
+    function SafeSingleScanRead(var TagRec: TTagRec; var values: TArrayOfDouble): TProtocolIOResult;
+
     procedure DoPortOpened(Sender: TObject);
     procedure DoPortClosed(Sender: TObject);
     procedure DoPortDisconnected(Sender: TObject);
     procedure DoPortRemoved(Sender:TObject);
+
     procedure SetIsReadOnly(AValue: Boolean);
     procedure UpdateUserTime(usertime:Double);
   protected
@@ -599,7 +602,7 @@ type
 
     {$IFDEF PORTUGUES}
     {:
-    Solicita a leitura por scan (@bold(assincrona)) de um tag.
+    Solicita uma leitura por scan (@bold(assincrona)) de um tag.
     @param(tagrec TTagRec. Estrutura com as informações do tag que se deseja ler.)
     @returns(Cardinal. Número único do pedido de leitura por scan.)
     }
@@ -610,7 +613,7 @@ type
     @returns(Cardinal. The unique identification number of the request.)
     }
     {$ENDIF}
-    function  ScanRead(const tagrec:TTagRec):Cardinal;
+    function  SingleScanRead(const tagrec:TTagRec):Cardinal;
 
     {$IFDEF PORTUGUES}
     {:
@@ -757,7 +760,7 @@ var
 
 implementation
 
-uses PLCTag, hsstrings, math, crossdatetime, pascalScadaMTPCPU;
+uses dateutils, PLCTag, hsstrings, math, crossdatetime, pascalScadaMTPCPU;
 
 ////////////////////////////////////////////////////////////////////////////////
 //             inicio da implementação de TProtocolDriver
@@ -767,6 +770,13 @@ uses PLCTag, hsstrings, math, crossdatetime, pascalScadaMTPCPU;
 constructor TProtocolDriver.Create(AOwner:TComponent);
 begin
   inherited Create(AOwner);
+  FScanReadID  := 0;
+  FScanWriteID := 0;
+  FReadID      := 0;
+  FWriteID     := 0;
+
+  PUpdatingMultipleTags:=0;
+
   FReadOnly:=0;
   PDriverID := DriverCount;
   Inc(DriverCount);
@@ -792,15 +802,9 @@ begin
   {$IFNDEF WINCE}
   PScanReadThread.Priority:=tpTimeCritical;
   {$ENDIF}
-  PScanReadThread.OnDoScanRead := @SafeScanRead;
-  PScanReadThread.OnDoScanWrite := @SafeScanWrite;
-
-  //PScanWriteThread := TScanThread.Create(true, PScanUpdateThread);
-  //{$IFNDEF WINCE}
-  //PScanWriteThread.Priority:=tpTimeCritical;
-  //{$ENDIF}
-  //PScanWriteThread.OnDoScanRead    := nil;
-  //PScanWriteThread.OnDoScanWrite   := @SafeScanWrite;
+  PScanReadThread.OnDoScanRead       := @SafeScanRead;
+  PScanReadThread.OnDoScanWrite      := @SafeScanWrite;
+  PScanReadThread.OnDoSingleScanRead := @SafeSingleScanRead;
 end;
 
 procedure TProtocolDriver.AfterConstruction;
@@ -809,7 +813,7 @@ begin
   PScanUpdateThread.WakeUp;
 
   PScanReadThread.WakeUp;
-  PScanReadThread.WaitInit;
+  PScanReadThread.WaitLoopStarts;
 
   //PScanWriteThread.WakeUp;
   //PScanWriteThread.WaitInit;
@@ -916,8 +920,6 @@ begin
       FReadCS.Enter;
     end;
 
-
-    
     DoAddTag(TagObj,false);
   finally
     if InterLockedExchange(PUpdatingMultipleTags,PUpdatingMultipleTags)=0 then begin
@@ -931,26 +933,28 @@ end;
 
 procedure TProtocolDriver.StartUpdateMultipleTags;
 begin
-  if InterLockedExchange(PUpdatingMultipleTags,PUpdatingMultipleTags)=0 then begin
+  //if I'm the first starting this multiple tags update,
+  //gets the mutexes
+  if InterLockedIncrement(PUpdatingMultipleTags)=1 then begin
     while not FPause.ResetEvent do
       CrossThreadSwitch;
 
     FWriteCS.Enter;
     FReadCS.Enter;
   end;
-  InterLockedIncrement(PUpdatingMultipleTags);
 end;
 
 procedure TProtocolDriver.StopUpdateMultipleTags;
 begin
-  if InterLockedExchange(PUpdatingMultipleTags,PUpdatingMultipleTags)>0 then begin
+  if InterLockedDecrement(PUpdatingMultipleTags)<=0 then begin
 
     FReadCS.Leave;
     FWriteCS.Leave;
 
     while not FPause.SetEvent do
       CrossThreadSwitch;
-    InterLockedDecrement(PUpdatingMultipleTags);
+
+    InterLockedExchange(PUpdatingMultipleTags, 0);
   end;
 end;
 
@@ -997,7 +1001,7 @@ function TProtocolDriver.GetTagCount: LongInt;
 begin
   //FCritical.Enter;
   try
-    Result := PTags.Count;
+    InterLockedExchange(Result, PTags.Count);
   finally
     //FCritical.Leave;
   end;
@@ -1055,7 +1059,9 @@ begin
   end;
 end;
 
-function TProtocolDriver.ScanRead(const tagrec:TTagRec):Cardinal;
+function TProtocolDriver.SingleScanRead(const tagrec: TTagRec): Cardinal;
+var
+   pkg:PScanReqRec;
 begin
   try
     PCallersCS.Enter;
@@ -1072,14 +1078,29 @@ begin
     //
     //increment the scan read unique identification
     if FScanReadID=$FFFFFFFF then
-       FScanReadID := 0
+       FScanReadID := 1
     else
        inc(FScanReadID);
+
+    //cria um pacote de leitura por scan
+    //creates the message of scan read
+    New(pkg);
+    //copia o TagRec
+    //copy the tagrec
+    pkg^.Tag:=tagrec;
+    //copia o id da requisição
+    //copy the request id
+    pkg^.Tag.ID:=FScanReadID;
+    //copia os valores
+    //copy the values
+    SetLength(pkg^.Values, 0);
+    pkg^.RequestResult:=ioNone;
+    pkg^.ValueTimeStamp:=CrossNow;
 
     //posta uma mensagem de Leitura por Scan
     //send a message requesting a scanread
     if (PScanUpdateThread<>nil) then
-      PScanUpdateThread.ScanRead(tagrec);
+      PScanReadThread.SingleScanRead(pkg);
 
     Result := FScanReadID;
 
@@ -1090,11 +1111,12 @@ end;
 
 function TProtocolDriver.ScanWrite(const tagrec:TTagRec; const Values:TArrayOfDouble):Cardinal;
 var
-   pkg:PScanWriteRec;
+   pkg:PScanReqRec;
 begin
   //read only protocol.
   if GetIsReadOnly then begin
-    tagrec.CallBack(Values,Now,tcScanWrite,ioReadOnlyProtocol,tagrec.RealOffset);
+    tagrec.CallBack(0, Values,Now,tcScanWrite,ioReadOnlyProtocol,tagrec.RealOffset);
+    Result:=0;
     exit;
   end;
 
@@ -1113,21 +1135,23 @@ begin
     //
     //increment the scan write unique identification
     if FScanWriteID=$FFFFFFFF then
-       FScanWriteID := 0
+       FScanWriteID := 1
     else
        inc(FScanWriteID);
        
     //cria um pacote de escrita por scan
     //creates the message of scan write
     New(pkg);
-    pkg^.SWID:=FScanReadID;
     //copia o TagRec
     //copy the tagrec
     Move(tagrec, pkg^.Tag, sizeof(TTagRec));
+    //copia o id da requisição
+    //copy the request id
+    pkg^.Tag.ID:=FScanWriteID;
     //copia os valores
     //copy the values
-    pkg^.ValuesToWrite := Values;
-    pkg^.WriteResult:=ioNone;
+    pkg^.Values := Values;
+    pkg^.RequestResult:=ioNone;
     pkg^.ValueTimeStamp:=CrossNow;
 
     //posta uma mensagem de Escrita por Scan
@@ -1158,7 +1182,7 @@ begin
     FReadCS.Enter;
     res := DoRead(tagrec,Values,true);
     if assigned(tagrec.CallBack) then
-      tagrec.CallBack(Values,CrossNow,tcRead,res,tagrec.RealOffset);
+      tagrec.CallBack(0, Values,CrossNow,tcRead,res,tagrec.RealOffset);
   finally
     FReadCS.Leave;
     FWriteCS.Leave;
@@ -1172,7 +1196,7 @@ var
   res:TProtocolIOResult;
 begin
   if GetIsReadOnly then begin
-    tagrec.CallBack(Values,Now,tcWrite,ioReadOnlyProtocol,tagrec.RealOffset);
+    tagrec.CallBack(0, Values,Now,tcWrite,ioReadOnlyProtocol,tagrec.RealOffset);
     exit;
   end;
 
@@ -1187,7 +1211,7 @@ begin
 
     res := DoWrite(tagrec,Values,true);
     if assigned(tagrec.CallBack) then
-      tagrec.CallBack(Values,CrossNow,tcWrite,res,tagrec.RealOffset);
+      tagrec.CallBack(0, Values,CrossNow,tcWrite,res,tagrec.RealOffset);
   finally
     FReadCS.Leave;
     FWriteCS.Leave;
@@ -1278,6 +1302,25 @@ begin
   end;
 end;
 
+function  TProtocolDriver.SafeSingleScanRead(var TagRec:TTagRec; var values:TArrayOfDouble):TProtocolIOResult;
+begin
+  try
+    //tenta entrar no Mutex
+    //try enter on mutex
+    while not FPause.ResetEvent do
+      CrossThreadSwitch;
+
+    FWriteCS.Enter;
+    FReadCS.Enter;
+
+    Result := DoRead(TagRec,values,false)
+  finally
+    FReadCS.Leave;
+    FWriteCS.Leave;
+    FPause.SetEvent;
+  end;
+end;
+
 procedure TProtocolDriver.SafeGetValue(const TagRec:TTagRec; var values:TScanReadRec);
 begin
   try
@@ -1303,7 +1346,8 @@ var
   tr:TTagRec;
   remainingMs:Int64;
   ScanReadRec:TScanReadRec;
-  doneOne:Boolean;
+  doneOne, PortError:Boolean;
+  ErrorStatus: TProtocolIOResult;
 begin
   doneOne:=false;
   try
@@ -1318,10 +1362,16 @@ begin
     FReadCS.Enter;
 
     if ComponentState*[csDestroying]<>[] then exit;
+    PortError:=false;
 
-    if (PCommPort=nil) or (not PCommPort.ReallyActive) then begin
-      Result:=50; //waits 50ms
-      exit;
+    if (PCommPort=nil) then begin
+      PortError:=true;
+      ErrorStatus:=ioNullCommPort;
+    end else begin
+      if (PCommPort.ReallyActive=false) then begin
+        PortError:=true;
+        ErrorStatus:=ioCommPortClosed;
+      end;
     end;
 
     for t:=0 to TagCount-1 do begin
@@ -1343,19 +1393,36 @@ begin
             end else
               Result := Min(remainingMs, Result);
           end else begin
-            doneOne:=true;
-            inc(valueSet);
-            SetLength(MultiValues,valueSet+1);
 
             tagiface.BuildTagRec(tr,0,0);
-
             SetLength(ScanReadRec.Values, tr.Size);
-            DoGetValue(tr, ScanReadRec);
+            if PortError then begin
+              ScanReadRec.ValuesTimestamp:=CrossNow;
+              ScanReadRec.LastQueryResult:=ErrorStatus;
+              ScanReadRec.Offset:=0;
+              ScanReadRec.ReadFaults:=0;
+              ScanReadRec.ReadsOK:=0;
+              ScanReadRec.RealOffset:=0;
+            end else
+              DoGetValue(tr, ScanReadRec);
 
-            MultiValues[valueSet].LastResult    :=ScanReadRec.LastQueryResult;
-            MultiValues[valueSet].CallBack      :=tr.CallBack;
-            MultiValues[valueSet].Values        :=ScanReadRec.Values;
-            MultiValues[valueSet].ValueTimeStamp:=ScanReadRec.ValuesTimestamp;
+            if ScanReadRec.ValuesTimestamp>tagiface.GetLastUpdateTimestamp then begin
+              //calcula o tempo para a proxima atualização
+              if first then begin
+                 Result:=tagiface.GetUpdateTime-MilliSecondsBetween(CrossNow,ScanReadRec.ValuesTimestamp);
+                 first:=false;
+               end else
+                 Result := Min(tagiface.GetUpdateTime-MilliSecondsBetween(CrossNow,ScanReadRec.ValuesTimestamp), Result);
+
+              doneOne:=true;
+              inc(valueSet);
+              SetLength(MultiValues,valueSet+1);
+
+              MultiValues[valueSet].LastResult    :=ScanReadRec.LastQueryResult;
+              MultiValues[valueSet].CallBack      :=tr.CallBack;
+              MultiValues[valueSet].Values        :=ScanReadRec.Values;
+              MultiValues[valueSet].ValueTimeStamp:=ScanReadRec.ValuesTimestamp;
+            end;
           end;
         end;
       end;
@@ -1363,7 +1430,6 @@ begin
 
   finally
     FReadCS.Leave;
-    if doneOne then Result:=0;
     FPause.SetEvent;
   end;
 end;

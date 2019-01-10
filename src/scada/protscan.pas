@@ -22,7 +22,7 @@ interface
 
 uses
   Classes, SysUtils, CrossEvent, protscanupdate, MessageSpool, syncobjs,
-  ProtocolTypes{$IFNDEF FPC}, Windows{$ENDIF};
+  crossthreads, ProtocolTypes{$IFNDEF FPC}, Windows{$ENDIF};
 
 type
 
@@ -42,11 +42,10 @@ type
   @seealso(TProtocolDriver)
   }
   {$ENDIF}
-  TScanThread = class(TCrossThread)
+  TScanThread = class(TpSCADACoreAffinityThreadWithLoop)
   private
-    FInitEvent:TCrossEvent;
+    FDoSingleScanRead: TSingleScanReadProc;
     FWaitToWrite:TCrossEvent;
-    FEnd:TCrossEvent;
 
     FDoScanRead:TScanReadProc;
     FDoScanWrite:TScanWriteProc;
@@ -56,16 +55,7 @@ type
     PScanUpdater:TScanUpdate;
 
     procedure SyncException;
-    function  WaitEnd(timeout:Cardinal):TWaitResult;
   protected
-    //: @exclude
-    procedure Execute; override;
-  public
-    //: @exclude
-    constructor Create(StartSuspended:Boolean; ScanUpdater:TScanUpdate);
-    //: @exclude
-    destructor Destroy; override;
-
     {$IFDEF PORTUGUES}
     //:Ordena a thread verificar se há comandos de escrita pendentes.
     {$ELSE}
@@ -73,31 +63,26 @@ type
     {$ENDIF}
     procedure CheckScanWriteCmd;
 
+    //: @exclude
+    procedure Loop; override;
+  public
+    //: @exclude
+    constructor Create(StartSuspended:Boolean; ScanUpdater:TScanUpdate);
+    //: @exclude
+    destructor Destroy; override;
+
     {$IFDEF PORTUGUES}
     //: Sinaliza para thread Terminar.
     {$ELSE}
     //: Requests the thread finalization.
     {$ENDIF}
-    procedure Terminate;
-
-    {$IFDEF PORTUGUES}
-    {:
-    Ao chamar @name, espera a thread sinalizar a sua inicialização. Se ela já foi
-    inicializada, não faz nada.
-    }
-    {$ELSE}
-    {:
-    When @name is called, waits the thread initialization. If it's already
-    initialized, does nothing.
-    }
-    {$ENDIF}
-    procedure WaitInit;
+    procedure Terminate; override;
 
     {$IFDEF PORTUGUES}
     {:
     Solicita uma escrita de valores por scan para a thread do driver de protocolo.
 
-    @param(SWPkg PScanWriteRec. Ponteiro para estrutura com as informações
+    @param(SWPkg PScanReadRec. Ponteiro para estrutura com as informações
            da escrita por scan do tag.)
     @raises(Exception caso a thread esteja suspensa ou não sinalize a sua
             inicialização em 5 segundos.)
@@ -106,12 +91,32 @@ type
     {:
     Put a values write request to be processed by the scan (queue) of protocol.
 
-    @param(SWPkg PScanWriteRec. Points to a structure with informations about
+    @param(SWPkg PScanReadRec. Points to a structure with informations about
            the write command.)
     @raises(Exception if the thread didn't responds.)
     }
     {$ENDIF}
-    procedure ScanWrite(SWPkg:PScanWriteRec);
+    procedure ScanWrite(SWPkg:PScanReqRec);
+
+    {$IFDEF PORTUGUES}
+    {:
+    Solicita uma leitura de valores por scan para a thread do driver de protocolo.
+
+    @param(SWPkg PScanReadRec. Ponteiro para estrutura com as informações
+           da escrita por scan do tag.)
+    @raises(Exception caso a thread esteja suspensa ou não sinalize a sua
+            inicialização em 5 segundos.)
+    }
+    {$ELSE}
+    {:
+    Put a read request to be processed by the scan (queue) of protocol.
+
+    @param(SWPkg PScanReadRec. Points to a structure with informations about
+           the write command.)
+    @raises(Exception if the thread didn't responds.)
+    }
+    {$ENDIF}
+    procedure SingleScanRead(SRPkg:PScanReqRec);
   published
     {$IFDEF PORTUGUES}
     {:
@@ -145,6 +150,14 @@ type
     }
     {$ENDIF}
     property OnDoScanWrite:TScanWriteProc read FDoScanWrite write FDoScanWrite;
+
+    {$IFDEF PORTUGUES}
+    //: Evento chamado para realizar a leitura de valoes de um tag.
+    {$ELSE}
+    //: Event called to execute a single scan read.
+    {$ENDIF}
+    property OnDoSingleScanRead:TSingleScanReadProc read FDoSingleScanRead write FDoSingleScanRead;
+
   end;
 
 implementation
@@ -162,72 +175,83 @@ begin
   Priority := tpHighest;
   FSpool := TMessageSpool.Create;
   PScanUpdater := ScanUpdater;
-  FInitEvent   := TCrossEvent.Create(true, false);
   FWaitToWrite := TCrossEvent.Create(true, false);
-  FEnd         := TCrossEvent.Create(true, false);
   FMinScan := 0;
 end;
 
 destructor TScanThread.Destroy;
 begin
   Terminate;
-  FInitEvent.Destroy;
-  FWaitToWrite.Destroy;
-  FSpool.Destroy;
-  FEnd.Destroy;
+  FreeAndNil(FWaitToWrite);
+  FreeAndNil(FSpool);
   inherited Destroy;
 end;
 
-procedure TScanThread.Execute;
+procedure TScanThread.Loop;
 var
   NeedSleep:LongInt;
 begin
-  //sinaliza q a fila de mensagens esta criada
-  //set as initialized the thread
-  FInitEvent.SetEvent;
-  while not Terminated do begin
-    CheckScanWriteCmd;
-    if Assigned(FDoScanRead) then begin
-      try
-        NeedSleep:=0;
-        FDoScanRead(Self, NeedSleep);
-        if NeedSleep>0 then
-          Sleep(NeedSleep);
-        if NeedSleep<0 then
-          CrossThreadSwitch;
-      except
-        //on E: Exception do begin
-        //  {$IFDEF FDEBUG}
-        //  DebugLn('TScanThread.Execute::' + e.Message);
-        //  DumpStack;
-        //  {$ENDIF}
-        //  erro := E;
-        //  Synchronize(@SyncException);
-        //end;
-      end;
+  CheckScanWriteCmd;
+  if Assigned(FDoScanRead) then begin
+    try
+      NeedSleep:=0;
+      FDoScanRead(Self, NeedSleep);
+      if NeedSleep>0 then
+        Sleep(NeedSleep);
+      if NeedSleep<0 then
+        CrossThreadSwitch;
+    except
+      //on E: Exception do begin
+      //  {$IFDEF FDEBUG}
+      //  DebugLn('TScanThread.Execute::' + e.Message);
+      //  DumpStack;
+      //  {$ENDIF}
+      //  erro := E;
+      //  Synchronize(@SyncException);
+      //end;
     end;
-
-    if FMinScan>0 then
-      Sleep(FMinScan);
   end;
-  FEnd.SetEvent;
+
+  if FMinScan>0 then
+    Sleep(FMinScan);
 end;
 
 procedure TScanThread.CheckScanWriteCmd;
 var
   PMsg:TMSMsg;
-  pkg:PScanWriteRec;
+  pkg:PScanReqRec;
 begin
-  if Assigned(FDoScanWrite) then begin
-    FWaitToWrite.WaitFor(1);
-    FWaitToWrite.ResetEvent;
-    while (not Terminated) and FSpool.PeekMessage(PMsg,PSM_TAGSCANWRITE,PSM_TAGSCANWRITE,true) do begin
-       pkg := PScanWriteRec(PMsg.wParam);
+  while (not Terminated) and FSpool.PeekMessage(PMsg,PSM_TAGSCANWRITE,PSM_SINGLESCANREAD,true) do begin
+    case PMsg.MsgID of
+      PSM_SINGLESCANREAD: begin
+        if Assigned(FDoSingleScanRead) then begin
+          FWaitToWrite.WaitFor(1); //TODO -oFabio: Why we should wait 1ms?
+          FWaitToWrite.ResetEvent;
 
-       pkg^.WriteResult := FDoScanWrite(pkg^.Tag,pkg^.ValuesToWrite);
+          pkg := PScanReqRec(PMsg.wParam);
 
-       if PScanUpdater<>nil then
-         PScanUpdater.ScanWriteCallBack(pkg);
+          pkg^.RequestResult := FDoSingleScanRead(pkg^.Tag, pkg^.Values);
+
+          if PScanUpdater<>nil then
+            PScanUpdater.ScanRequestCallBack(pkg, false);
+        end else                            
+          Dispose(PScanReqRec(PMsg.wParam));
+      end;
+
+      PSM_TAGSCANWRITE: begin
+        if Assigned(FDoScanWrite) then begin
+          FWaitToWrite.WaitFor(1); //TODO -oFabio: Why we should wait 1ms?
+          FWaitToWrite.ResetEvent;
+
+          pkg := PScanReqRec(PMsg.wParam);
+
+          pkg^.RequestResult := FDoScanWrite(pkg^.Tag,pkg^.Values);
+
+          if PScanUpdater<>nil then
+            PScanUpdater.ScanRequestCallBack(pkg);
+        end else
+          Dispose(PScanReqRec(PMsg.wParam));
+      end;
     end;
   end;
 end;
@@ -240,15 +264,9 @@ begin
   //end;
 end;
 
-procedure TScanThread.WaitInit;
+procedure TScanThread.ScanWrite(SWPkg: PScanReqRec);
 begin
-  while FInitEvent.WaitFor($FFFFFFFF)<>wrSignaled do ;
-end;
-
-procedure TScanThread.ScanWrite(SWPkg:PScanWriteRec);
-begin
-  if FInitEvent.WaitFor($FFFFFFFF)<>wrSignaled then
-    raise Exception.Create(SthreadSuspended);
+  WaitLoopStarts;
 
   //envia a mensagem
   //sends the message.
@@ -256,17 +274,22 @@ begin
   FWaitToWrite.SetEvent;
 end;
 
+procedure TScanThread.SingleScanRead(SRPkg: PScanReqRec);
+begin
+  WaitLoopStarts;
+
+  //envia a mensagem
+  //sends the message.
+  FSpool.PostMessage(PSM_SINGLESCANREAD, SRPkg, nil,true);
+  FWaitToWrite.SetEvent;
+end;
+
 procedure TScanThread.Terminate;
 begin
-  TCrossThread(self).Terminate;
+  inherited Terminate;
   repeat
      CheckSynchronize(1);
   until WaitEnd(1)=wrSignaled;
-end;
-
-function  TScanThread.WaitEnd(timeout:Cardinal):TWaitResult;
-begin
-   Result := FEnd.WaitFor(timeout);
 end;
 
 end.

@@ -21,7 +21,8 @@ unit protscanupdate;
 interface
 
 uses
-  Classes, SysUtils, CrossEvent, ProtocolTypes, MessageSpool, syncobjs, tag;
+  Classes, SysUtils, CrossEvent, ProtocolTypes, MessageSpool, syncobjs, tag,
+  crossthreads;
 
 type
 
@@ -41,12 +42,11 @@ type
   @seealso(TProtocolDriver)
   }
   {$ENDIF}
-  TScanUpdate = class(TCrossThread)
+  TScanUpdate = class(TpSCADACoreAffinityThreadWithLoop)
   private
     FUserUpdateTimePRoc:TUserUpdateTimeProc;
     FOwnerProtocolDriver:TComponent;
     FSleepInterruptable:TCrossEvent;
-    FEnd:TCrossEvent;
     TagCBack:TTagCommandCallBack;
     FTagRec:PTagRec;
     Fvalues:TScanReadRec;
@@ -59,10 +59,9 @@ type
     procedure SyncException;
     procedure UpdateMultipleTags;
     procedure CheckScanReadOrWrite;
-    function  WaitEnd(timeout:Cardinal):TWaitResult;
   protected
     //: @exclude
-    procedure Execute; override;
+    procedure Loop; override;
   public
     //: @exclude
     constructor Create(StartSuspended:Boolean; OwnerProtocol:TComponent; usrUpdTime:TUserUpdateTimeProc);
@@ -74,7 +73,7 @@ type
     {$ELSE}
     //: Requests the thread finalization.
     {$ENDIF}
-    procedure Terminate;
+    procedure Terminate; override;
 
     {$IFDEF PORTUGUES}
     {:
@@ -112,7 +111,7 @@ type
     @raises(Exception if the thread was not initialized.)
     }
     {$ENDIF}
-    procedure ScanWriteCallBack(SWPkg:PScanWriteRec);
+    procedure ScanRequestCallBack(SReqPkg:PScanReqRec; IsScanWrite:Boolean = true);
   published
 
     {$IFDEF PORTUGUES}
@@ -149,82 +148,68 @@ begin
   Priority := tpHighest;
   FUserUpdateTimePRoc:=usrUpdTime;
   FSpool := TMessageSpool.Create;
-  FEnd := TCrossEvent.Create(true, false);
-  FEnd.ResetEvent;
   FSleepInterruptable := TCrossEvent.Create(false, false);
 end;
 
 destructor TScanUpdate.Destroy;
 begin
   inherited Destroy;
+
   FSleepInterruptable.SetEvent;
-  FSleepInterruptable.Destroy;
-  FSpool.Destroy;
-  FEnd.Destroy;
+  FreeAndNil(FSleepInterruptable);
+  FreeAndNil(FSpool);
 end;
 
 procedure TScanUpdate.Terminate;
 begin
-  TCrossThread(self).Terminate;
+  inherited Terminate;
   FSleepInterruptable.SetEvent;
   repeat
      CheckSynchronize(1);
   until WaitEnd(1)=wrSignaled;
 end;
 
-function  TScanUpdate.WaitEnd(timeout:Cardinal):TWaitResult;
-begin
-   Result := FEnd.WaitFor(timeout);
-end;
-
-procedure TScanUpdate.Execute;
+procedure TScanUpdate.Loop;
 var
-  timeout:LongInt;
+  i, FValor, timeout:LongInt;
   FInicio:TDateTime;
-  FTempo, FVezes, FValor:LongInt;
-  FMedia:Double;
 begin
-  FTempo:=0;
-  FVezes:=0;
-  while not Terminated do begin
-    try
-      CheckScanReadOrWrite;
-      if Assigned(PScanTags) then begin
-        SetLength(PScannedValues,0);
-        timeout:=PScanTags(PScannedValues);
-        if Length(PScannedValues)>0 then begin
-          FInicio:=CrossNow;
-          Synchronize(@UpdateMultipleTags);
-          FValor:=MilliSecondsBetween(CrossNow,FInicio);
+  try
+    CheckScanReadOrWrite;
+    if Assigned(PScanTags) then begin
+      SetLength(PScannedValues,0);
+      timeout:=PScanTags(PScannedValues);
+      if Length(PScannedValues)>0 then begin
+        FInicio:=CrossNow;
+        Synchronize(@UpdateMultipleTags);
+        FValor:=MilliSecondsBetween(CrossNow,FInicio);
 
-          FTempo:=FTempo+FValor;
-          FVezes:=FVezes+1;
-          timeout:=timeout-FValor;
+        for i:=0 to High(PScannedValues) do
+          SetLength(PScannedValues[i].Values, 0);
 
-          FMedia:=FTempo div FVezes;
-          if Assigned(FUserUpdateTimePRoc) then
-            FUserUpdateTimePRoc(FMedia);
-        end;
-      end else
-        timeout:=1;
+        SetLength(PScannedValues, 0);
 
-      if not FSleepInterruptable.ResetEvent then FSleepInterruptable.ResetEvent;
-      if (timeout)>0 then begin
-        FSleepInterruptable.WaitFor(timeout)
-      end else
-        FSleepInterruptable.WaitFor(1);
-    except
-    //  on E: Exception do begin
-    //    {$IFDEF FDEBUG}
-    //    DebugLn('TScanUpdate.Execute:: ' + e.Message);
-    //    DumpStack;
-    //    {$ENDIF}
-    //    Ferro := E;
-    //    Synchronize(@SyncException);
-    //  end;
-    end;
+        timeout:=timeout-FValor;
+      end;
+    end else
+      timeout:=1;
+
+    if not FSleepInterruptable.ResetEvent then FSleepInterruptable.ResetEvent;
+    if (timeout)>0 then begin
+      FSleepInterruptable.WaitFor(timeout)
+    end else
+      FSleepInterruptable.WaitFor(1);
+  except
+  //  on E: Exception do begin
+  //    {$IFDEF FDEBUG}
+  //    DebugLn('TScanUpdate.Execute:: ' + e.Message);
+  //    DumpStack;
+  //    {$ENDIF}
+  //    Ferro := E;
+  //    Synchronize(@SyncException);
+  //  end;
   end;
-  FEnd.SetEvent;
+
 end;
 
 procedure TScanUpdate.ScanRead(Tag:TTagRec);
@@ -237,10 +222,15 @@ begin
   FSleepInterruptable.SetEvent;
 end;
 
-procedure TScanUpdate.ScanWriteCallBack(SWPkg:PScanWriteRec);
+procedure TScanUpdate.ScanRequestCallBack(SReqPkg: PScanReqRec;
+  IsScanWrite: Boolean);
 begin
-   FSpool.PostMessage(PSM_TAGSCANWRITE,SWPkg,nil,true);
-   FSleepInterruptable.SetEvent;
+  if IsScanWrite then
+    FSpool.PostMessage(PSM_TAGSCANWRITE,SReqPkg,nil,true)
+  else
+    FSpool.PostMessage(PSM_SINGLESCANREAD,SReqPkg,nil,true);
+
+  FSleepInterruptable.SetEvent;
 end;
 
 procedure TScanUpdate.SyncException;
@@ -264,41 +254,46 @@ begin
     if not found then continue;
     with PScannedValues[c] do
       try
-        CallBack(Values, ValueTimeStamp, tcScanRead, LastResult, 0);
-        SetLength(Values,0);
+        CallBack(0, Values, ValueTimeStamp, tcScanRead, LastResult, 0);
       finally
       end;
   end;
-  SetLength(PScannedValues,0);
 end;
 
 procedure TScanUpdate.CheckScanReadOrWrite;
 var
-  x:PScanWriteRec;
+  x:PScanReqRec;
   PMsg:TMSMsg;
 begin
-  while (not Terminated) and FSpool.PeekMessage(PMsg,PSM_TAGSCANREAD,PSM_TAGSCANWRITE,true) do begin
+  while (not Terminated) and FSpool.PeekMessage(PMsg,PSM_TAGSCANREAD,PSM_SINGLESCANREAD,true) do begin
     //try
       case PMsg.MsgID of
-        PSM_TAGSCANWRITE: begin
-          x := PScanWriteRec(PMsg.wParam);
+        PSM_TAGSCANWRITE, PSM_SINGLESCANREAD: begin
+          x := PScanReqRec(PMsg.wParam);
 
           TagCBack                := x^.Tag.CallBack;
-          Fvalues.Values          := x^.ValuesToWrite;
+          Fvalues.Values          := x^.Values;
           Fvalues.Offset          := x^.Tag.OffSet;
           Fvalues.RealOffset      := x^.Tag.RealOffset;
           Fvalues.ValuesTimestamp := x^.ValueTimeStamp;
-          Fvalues.LastQueryResult := x^.WriteResult;
-          FCmd:=tcScanWrite;
+          Fvalues.LastQueryResult := x^.RequestResult;
+          if PMsg.MsgID=PSM_TAGSCANWRITE then
+            FCmd:=tcScanWrite
+          else
+            FCmd:=tcSingleScanRead;
 
           //sincroniza com o tag.
           //sync tag (update it)
-          Synchronize(@SyncCallBack);
-
+          FTagRec:=@x^.Tag;
+          try
+            Synchronize(@SyncCallBack);
+          finally      
+            FTagRec:=nil;
+          end;
           //libera a memoria ocupada
           //pelo pacote
           //free the memory of the request
-          SetLength(x^.ValuesToWrite,0);
+          SetLength(x^.Values,0);
           Dispose(x);
           TagCBack:=nil;
         end;
@@ -338,11 +333,18 @@ begin
 end;
 
 procedure TScanUpdate.SyncCallBack;
+var
+  ReqID: LongWord;
 begin
   if Terminated then exit;
   //try
+    if Assigned(FTagRec) then
+      ReqID:=FTagRec^.ID
+    else
+      ReqID:=0;
+
     if Assigned(TagCBack) then
-      TagCBack(Fvalues.Values,Fvalues.ValuesTimestamp,FCmd,Fvalues.LastQueryResult, Fvalues.RealOffset);
+      TagCBack(ReqID, Fvalues.Values,Fvalues.ValuesTimestamp,FCmd,Fvalues.LastQueryResult, Fvalues.RealOffset);
   //except
   //  on erro:Exception do begin
   //    Ferro:=erro;

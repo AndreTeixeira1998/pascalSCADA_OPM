@@ -1683,29 +1683,29 @@ begin
           case ReqType of
             vtS7_DB:
               if (DBIdx>=0) AND (DBIdx<=High(FPLCs[PLCIdx].DBs)) then
-                FPLCs[PLCIdx].DBs[DBIdx].DBArea.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+                FPLCs[PLCIdx].DBs[DBIdx].DBArea.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Inputs:
-               FPLCs[PLCIdx].Inputs.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].Inputs.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Outputs:
-               FPLCs[PLCIdx].Outputs.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].Outputs.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_200_AnInput:
-               FPLCs[PLCIdx].S7200AnInput.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].S7200AnInput.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_200_AnOutput:
-               FPLCs[PLCIdx].S7200AnOutput.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].S7200AnOutput.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Timer:
-               FPLCs[PLCIdx].Timers.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].Timers.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Counter:
-               FPLCs[PLCIdx].Counters.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].Counters.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Flags:
-               FPLCs[PLCIdx].Flags.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].Flags.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_200_SM:
-               FPLCs[PLCIdx].S7200SMs.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].S7200SMs.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_200_Timer:
-               FPLCs[PLCIdx].S7200Timers.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].S7200Timers.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_200_Counter:
-               FPLCs[PLCIdx].S7200Counters.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].S7200Counters.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
             vtS7_Peripheral:
-               FPLCs[PLCIdx].PeripheralInputs.SetFault(StartAddress,Size,1,ProtocolErrorCode);
+               FPLCs[PLCIdx].PeripheralInputs.SetFault(StartAddress,Size,1,ProtocolErrorCode, true);
           end;
       end;
     end;
@@ -2221,11 +2221,13 @@ begin
       RequestsPendding:=false;
       for c:=0 to EntireTagList.Count-1 do begin
         ReqItem:=EntireTagList.Items[c];
+        //if tag was read on a previous PDU fill, go to next...
         if ReqItem.Read then continue;
-        if (PReadSomethingAlways=false) AND (ReqItem.NeedUpdate=false) then continue;
-        if MilliSecondsBetween(Now, started)>100 then break;
 
-        if not AcceptThisRequest(FPLCs[ReqItem.iPLC], ReqItem.iSize) and ((c+1) < EntireTagList.Count) then begin
+        //if ReadSomethingAlways is disabled and tag don't need to be updated, go to next.
+        if (PReadSomethingAlways=false) AND (ReqItem.NeedUpdate=false) then continue;
+
+        if not AcceptThisRequest(FPLCs[ReqItem.iPLC], ReqItem.iSize) then begin
           for c2:=(c+1) to EntireTagList.Count-1 do begin
             ReqItem2:=EntireTagList.Items[c2];
             if ReqItem2.Read then continue;
@@ -2238,6 +2240,7 @@ begin
           end;
           ReadQueuedRequests(FPLCs[ReqItem.iPLC]);
           Reset;
+          Break;
           if ReqItem.NeedUpdate=false then exit;
         end;
         pkg_initialized;
@@ -2364,13 +2367,13 @@ begin
   end;
 
   if retries>=3 then begin
-    Result:=ioDriverError;
+    Result:=ioAdapterInitFail;
     exit;
   end;
 
   if not PLCPtr^.Connected then
     if not connectPLC(PLCPtr^) then begin
-      Result:=ioDriverError;
+      Result:=ioConnectPLCFailed;
       exit;
     end;
 

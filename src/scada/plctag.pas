@@ -38,12 +38,15 @@ type
   }
   {$ENDIF}
   TPLCTag = class(TTag, IManagedTagInterface)
-  private
+  protected
     FRawProtocolValues:TArrayOfDouble;
+    FLastScanReadReqID,
+    FLastScanWriteReqID,
     FTotalTime, FReadCount:Int64;
     FFirtsRead:Boolean;
     FProtocoloOnLoading:TProtocolDriver;
-  private
+    function GetLastScanReadReqID: Int64;
+    function GetLastScanWriteReqID: Int64;
     procedure RebuildTagGUID;
     function  GetTagSizeOnProtocol:LongInt;
   protected
@@ -53,6 +56,7 @@ type
     procedure GetNewProtocolTagSize;
     function RemainingMiliseconds:Int64; virtual;
     function RemainingMilisecondsForNextScan:Int64; virtual;
+    function GetUpdateTime:Int64; virtual;
     function IsValidTag:Boolean; virtual;
     procedure SetTagValidity(TagValidity:Boolean); virtual;
     property Modified:Boolean read PModified;
@@ -431,7 +435,7 @@ type
     {$ELSE}
     //: Procedure called by the protocol driver to update tag values.
     {$ENDIF}
-    procedure TagCommandCallBack(Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt); virtual;
+    procedure TagCommandCallBack(const ReqID:LongWord; Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt); virtual;
 
     {$IFDEF PORTUGUES}
     {:
@@ -451,7 +455,7 @@ type
     {$ELSE}
     //: Request a update of tag values.
     {$ENDIF}
-    procedure ScanRead; virtual;
+    function ScanRead:Int64; virtual;
 
     {$IFDEF PORTUGUES}
     {:
@@ -468,7 +472,7 @@ type
     @param(Offset Cardinal: Tells offset after the address where the values will be written.)
     }
     {$ENDIF}
-    procedure ScanWrite(Values:TArrayOfDouble; Count, Offset:Cardinal); virtual; abstract;
+    function ScanWrite(Values:TArrayOfDouble; Count, Offset:Cardinal; const IgnoreAutoWrite:Boolean = false):Int64; virtual; abstract;
 
     {$IFDEF PORTUGUES}
     //: Faz uma leitura @bold(sincrona) do valor do tag.
@@ -496,6 +500,8 @@ type
 
     //: @exclude
     procedure Loaded; override;
+
+    function GetLastUpdateTimestamp:TDateTime; virtual;
 
     //: @seealso(TTag.AutoRead)
     property AutoRead write SetAutoRead default true;
@@ -604,6 +610,20 @@ type
     //: Average update rate of the tag.
     {$ENDIF}
     property AvgUpdateRate:Double read GetAvgUpdateRate;
+
+    {$IFDEF PORTUGUES}
+    //: Id da ultima requisição de ScanRead.
+    {$ELSE}
+    //: Last ScanRead request id.
+    {$ENDIF}
+    property LastScanReadReqID:Int64 read GetLastScanReadReqID;
+
+    {$IFDEF PORTUGUES}
+    //: Id da ultima requisição de ScanWrite.
+    {$ELSE}
+    //: Last ScanWrite request id.
+    {$ENDIF}
+    property LastScanWriteReqID:Int64 read GetLastScanWriteReqID;
   public
     //: @exclude
     constructor Create(AOwner:TComponent); override;
@@ -785,7 +805,9 @@ begin
   end;
 end;
 
-procedure TPLCTag.TagCommandCallBack(Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; Offset:LongInt);
+procedure TPLCTag.TagCommandCallBack(const ReqID: LongWord;
+  Values: TArrayOfDouble; ValuesTimeStamp: TDateTime; TagCommand: TTagCommand;
+  LastResult: TProtocolIOResult; Offset: LongInt);
 var
   c, poffset:LongInt;
 begin
@@ -794,8 +816,18 @@ begin
     inc(FReadCount);
   end;
 
-  if TagCommand=tcScanRead then
-    PLastScanTimeStamp:=CrossNow;
+  case TagCommand of
+    tcScanRead:                    
+      PLastScanTimeStamp:=CrossNow;
+
+    tcSingleScanRead: begin
+      PLastScanTimeStamp:=CrossNow;
+      FLastScanReadReqID:=ReqID;
+    end;
+
+    tcScanWrite:
+      FLastScanWriteReqID:=ReqID;
+  end;
 
   if (LastResult=ioOk) then
     FFirtsRead:=false;
@@ -1024,9 +1056,9 @@ begin
   tr.CallBack := @TagCommandCallBack;
 end;
 
-procedure TPLCTag.ScanRead;
+function TPLCTag.ScanRead: Int64;
 begin
-
+  Result:=-1;
 end;
 
 procedure TPLCTag.GetNewProtocolTagSize;
@@ -1046,6 +1078,16 @@ end;
 function  TPLCTag.GetTagSizeOnProtocol:LongInt;
 begin
   Result := Length(FRawProtocolValues);
+end;
+
+function TPLCTag.GetLastScanReadReqID: Int64;
+begin
+  Result:=FLastScanReadReqID;
+end;
+
+function TPLCTag.GetLastScanWriteReqID: Int64;
+begin
+  Result:=FLastScanWriteReqID;
 end;
 
 procedure TPLCTag.RebuildTagGUID;
@@ -1081,6 +1123,11 @@ begin
 
   with FTagManager as TTagMananger do
     AddTag(Self);
+end;
+
+function TPLCTag.GetLastUpdateTimestamp: TDateTime;
+begin
+  Result:=PValueTimeStamp;
 end;
 
 procedure TPLCTag.SetGUID(v:AnsiString);
@@ -1164,7 +1211,7 @@ end;
 
 procedure TPLCTag.RebuildValues;
 begin
-  TagCommandCallBack(FRawProtocolValues,ValueTimestamp,tcInternalUpdate,ioOk,0);
+  TagCommandCallBack(0, FRawProtocolValues,ValueTimestamp,tcInternalUpdate,ioOk,0);
 end;
 
 function TPLCTag.PLCValuesToTagValues(Values:TArrayOfDouble; Offset:Cardinal):TArrayOfDouble;
@@ -1185,6 +1232,7 @@ var
   PtrByte1, PtrByte2:PByte;
   PtrWord1, PtrWord2:PWord;
   PtrDWord1, PtrDWord2:PDWord;
+  pttSize, ttSize, resIdx: Integer;
 
   procedure ResetPointers;
   begin
@@ -1198,35 +1246,38 @@ var
   var
     i:LongInt;
   begin
-    i:=Length(Result);
-    SetLength(Result,i+1);
-    Result[i]:=ValueToAdd;
+    //i:=Length(Result);
+    //SetLength(Result,i+1);
+    Result[resIdx]:=ValueToAdd;
+    resIdx:=resIdx+1;
   end;
 
 begin
-  if (FTagType=pttDefault) OR
-     ((FProtocolTagType=ptByte) AND (FTagType=pttByte)) OR
-     ((FProtocolTagType=ptShortInt) AND (FTagType=pttShortInt)) OR
-     ((FProtocolTagType=ptWord) AND (FTagType=pttWord)) OR
-     ((FProtocolTagType=ptSmallInt) AND (FTagType=pttSmallInt)) OR
-     ((FProtocolTagType=ptDWord) AND (FTagType=pttDWord)) OR
-     ((FProtocolTagType=ptLongInt) AND (FTagType=pttLongInt)) OR
-     ((FProtocolTagType=ptFloat) AND (FTagType=pttFloat)) Or
-     ((FProtocolTagType=ptInt64) AND (FTagType=pttInt64)) Or
-     ((FProtocolTagType=ptQWord) AND (FTagType=pttQWord)) Or
-     ((FProtocolTagType=ptDouble) AND (FTagType=pttDouble))
-  then begin
+  pttSize := ProtocolTagTypeSizeInBits[FProtocolTagType];
+  ttSize  := TagSizeInBits(FTagType,pttSize);
+  resIdx  := 0;
+  //if (FTagType=pttDefault) OR
+  //   ((FProtocolTagType=ptByte) AND (FTagType=pttByte)) OR
+  //   ((FProtocolTagType=ptShortInt) AND (FTagType=pttShortInt)) OR
+  //   ((FProtocolTagType=ptWord) AND (FTagType=pttWord)) OR
+  //   ((FProtocolTagType=ptSmallInt) AND (FTagType=pttSmallInt)) OR
+  //   ((FProtocolTagType=ptDWord) AND (FTagType=pttDWord)) OR
+  //   ((FProtocolTagType=ptLongInt) AND (FTagType=pttLongInt)) OR
+  //   ((FProtocolTagType=ptFloat) AND (FTagType=pttFloat)) Or
+  //   ((FProtocolTagType=ptInt64) AND (FTagType=pttInt64)) Or
+  //   ((FProtocolTagType=ptQWord) AND (FTagType=pttQWord)) Or
+  //   ((FProtocolTagType=ptDouble) AND (FTagType=pttDouble))
+  if pttSize=ttSize then begin
     Result:=Values;
     exit;
   end;
 
-  //calcula quantos bytes precisam ser alocados.
-  //calculate how many bytes must be allocated.
-  SetLength(Result,0);
+  resIdx  := 0;
+  SetLength(Result, ((Length(Values)*pttSize) div ttSize)+ifthen(((Length(Values)*pttSize) mod ttSize)<>0,1,0));
 
   case FProtocolTagType of
     ptBit:
-      AreaSize := Length(Values) div 8;
+      AreaSize := Length(Values) div 8 + ifthen((Length(Values) mod 8) <> 0, 1, 0);
     ptByte, ptShortInt:
       AreaSize := Length(Values);
     ptWord, ptSmallInt:
@@ -1909,6 +1960,11 @@ end;
 function TPLCTag.RemainingMilisecondsForNextScan:Int64;
 begin
   Result:=PUpdateTime-MilliSecondsBetween(CrossNow,PLastScanTimeStamp);
+end;
+
+function TPLCTag.GetUpdateTime: Int64;
+begin
+  Result:=PUpdateTime;
 end;
 
 function TPLCTag.IsValidTag:Boolean;

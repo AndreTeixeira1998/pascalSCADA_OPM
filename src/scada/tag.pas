@@ -127,7 +127,7 @@ type
   @value(tcInternalUpdate  Internal tag update command.)
   }
   {$ENDIF}
-  TTagCommand = (tcScanRead, tcScanWrite, tcRead, tcWrite, tcInternalUpdate);
+  TTagCommand = (tcScanRead, tcScanWrite, tcRead, tcWrite, tcInternalUpdate, tcSingleScanRead);
 
   {$IFDEF PORTUGUES}
   {:
@@ -184,12 +184,14 @@ type
                        ioUnknownError, ioEmptyPacket, ioPartialOk,
                        ioAcknowledge, ioBusy, ioNACK, ioMemoryParityError,
                        ioGatewayUnavailable, ioDeviceGatewayFailedToRespond,
-                       ioReadOnlyProtocol);
+                       ioReadOnlyProtocol, ioCommPortClosed, ioNullCommPort,
+                       ioConnectPLCFailed, ioAdapterInitFail);
 
   {$IFDEF PORTUGUES}
   {:
   Callback chamado pelo driver de protocolo (TProtocolDriver) para retornar o
-  resultado de uma solicitação e os respectivos valores.
+  resultado de uma solicitação e os respectivos valores.    
+  @param(ReqID LongWord: Identificador de requisição ScanRead/ScanWrite.)
   @param(Values TArrayOfDouble: Array com os valores lidos/escritos.)
   @param(ValuesTimeStamp TDateTime: Data/Hora em que esses valores foram lidos/escritos.)
   @param(TagCommand TTagCommand: Tipo de comando.)
@@ -200,6 +202,7 @@ type
   {:
   Callback called by the protocol driver (TProtocolDriver) to return the result
   of an request and theirs values.
+  @param(ReqID LongWord: The ScanRead/ScanWrite request id.)
   @param(Values TArrayOfDouble: Array with the values read/written.)
   @param(ValuesTimeStamp TDateTime: Date/Time when these values are read/written.)
   @param(TagCommand TTagCommand: Command type.)
@@ -207,7 +210,7 @@ type
   @param(Offset Cardinal: Block Offset.)
   }
   {$ENDIF}
-  TTagCommandCallBack = procedure(Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; OffSet:LongInt) of object;
+  TTagCommandCallBack = procedure(const ReqID:LongWord; Values:TArrayOfDouble; ValuesTimeStamp:TDateTime; TagCommand:TTagCommand; LastResult:TProtocolIOResult; OffSet:LongInt) of object;
 
   {$IFDEF PORTUGUES}
   {:
@@ -253,6 +256,7 @@ type
   }
   {$ENDIF}
   TTagRec = record
+    ID:LongWord;
     Rack:LongInt;
     Slot:LongInt;
     Station:LongInt;
@@ -348,6 +352,10 @@ type
     //: Gets a structure with informations about the tag.
     {$ENDIF}
     procedure BuildTagRec(out tr:TTagRec; Count, OffSet:LongInt);
+
+    function GetLastUpdateTimestamp:TDateTime;
+
+    function GetUpdateTime:Int64;
   end;
 
   TASyncValueChangeNotify = procedure(Sender:TObject; const Value:TArrayOfDouble) of object;
@@ -937,8 +945,24 @@ type
 
   TArrayOfScanUpdateRec = array of TScanUpdateRec;
 
+  function TagSizeInBits(const TagType:TTagType; const pttDefaultSize:Integer):Integer;
 
 implementation
+
+function TagSizeInBits(const TagType: TTagType; const pttDefaultSize: Integer
+  ): Integer;
+var
+  SizeInBits:array[low(TTagType)..high(TTagType)] of integer = (
+              0,          //pttDefault
+              08, 08,     //pttShortInt, pttByte,            //8 bits
+              16, 16,     //pttSmallInt, pttWord,            //16 bits
+              32, 32, 32, //pttLongInt,  pttDWord, pttFloat, //32 bits
+              64, 64, 64  //pttInt64,    pttQWord, pttDouble //64 bits
+             );
+begin
+  SizeInBits[pttDefault]:=pttDefaultSize;
+  Result:=SizeInBits[TagType];
+end;
 
 constructor TTag.Create(AOwner:TComponent);
 var

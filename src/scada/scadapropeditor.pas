@@ -29,7 +29,7 @@ interface
 uses
   Classes, SysUtils, SerialPort, PLCBlockElement, PLCStruct, Tag,
   bitmappertagassistant, blockstructtagassistant, ProtocolDriver,
-  PLCNumber, fpexprpars,
+  PLCNumber, comptagedt, fpexprpars,
 
   {$IF defined(WIN32) or defined(WIN64) OR defined(WINCE)}
   Windows,
@@ -206,16 +206,50 @@ type
     procedure Edit; override;
   end;
 
+  procedure ChangeComponentTag(Sender: TObject);
+
 implementation
 
-uses PLCBlock, PLCTagNumber, PLCString, RtlConsts;
+uses PLCBlock, PLCTagNumber, PLCString, RtlConsts, FormEditingIntf,
+  Controls;
+
+procedure ChangeComponentTag(Sender: TObject);
+var
+  aSelected: TPersistentSelectionList;
+  frm: TfrmTComponentTagEditor;
+begin
+  aSelected:=TPersistentSelectionList.Create;
+  try
+    if Assigned(GlobalDesignHook) then begin
+      GlobalDesignHook.GetSelection(aSelected);
+      if (aSelected.Count=1) and (aSelected.Items[0] is TComponent) then begin
+        frm:=TfrmTComponentTagEditor.Create(nil);
+        try
+          frm.Label1.Caption:=Format('Set new value %s.Tag', [TComponent(aSelected.Items[0]).Name]);
+          frm.Edit1.Text:=IntToStr(TComponent(aSelected.Items[0]).Tag);
+          frm.Edit1.SelectAll;
+          if frm.ShowModal=mrOK then begin
+            TComponent(aSelected.Items[0]).Tag:=frm.Value;
+            GlobalDesignHook.Modified(aSelected.Items[0]);
+          end;
+        finally
+          FreeAndNil(frm);
+        end;
+      end;
+    end;
+  finally
+    FreeAndNil(aSelected);
+  end;
+end;
 
 function  TPortPropertyEditor.GetAttributes: TPropertyAttributes;
 begin
-   if GetComponent(0) is TSerialPortDriver then
-      Result := [paValueList{$IFDEF FPC}, paPickList{$ELSE}
-                 {$IFDEF DELPHI2005_UP}, paReadOnly,
-                 paValueEditable{$ENDIF}{$ENDIF}];
+   if (GetComponent(0) is TSerialPortDriver) and (GetComponent(0) as TSerialPortDriver).AcceptAnyPortName=false then
+     Result := [paValueList{$IFDEF FPC}, paPickList{$ELSE}
+                {$IFDEF DELPHI2005_UP}, paReadOnly,
+                paValueEditable{$ENDIF}{$ENDIF}]
+   else
+     Result:=inherited GetAttributes;
 end;
 
 function  TPortPropertyEditor.GetValue: AnsiString;
@@ -242,6 +276,15 @@ begin
 var
    c, d:LongInt;
    pname:AnsiString;
+
+   function PortDirPrefix:AnsiString;
+   begin
+     if Assigned(GetComponent(0)) and (GetComponent(0) is TSerialPortDriver) then
+       Result:=(GetComponent(0) as TSerialPortDriver).DevDir
+     else
+       Result:='/dev/';
+   end;
+
 begin
    Proc('(none)');
    for d:=0 to High(PortPrefix) do
@@ -252,7 +295,7 @@ begin
       for c:=0 to 255 do begin
          pname:=PortPrefix[d]+IntToStr(c);
       {$ENDIF}
-         if FileExists('/dev/'+pname) then
+         if FileExists(PortDirPrefix+pname) then // Added DevDir property.
             Proc(pname);
       end;
 {$ENDIF}

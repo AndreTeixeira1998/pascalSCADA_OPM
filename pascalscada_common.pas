@@ -7,9 +7,9 @@ unit pascalscada_common;
 interface
 
 uses
-  crossdatetime, CrossEvent, hsstrings, hsutils, MessageSpool, 
+  crossdatetime, crossevent, hsstrings, hsutils, MessageSpool, 
   pascalScadaMTPCPU, pscada_common, pscommontypes, pSCADAVersion, 
-  LazarusPackageIntf;
+  crossthreads, LazarusPackageIntf;
 
 implementation
 
