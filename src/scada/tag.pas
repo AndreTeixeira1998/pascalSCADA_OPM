@@ -14,7 +14,14 @@
   ***********************************************************************
   07/2013 - Avoid the use of Linux-Widget if fpc >= 2.7.1 (CONSOLEPASCALSCADA)
   @author(Juanjo Montero <juanjo.montero@gmail.com>)
+
+  02/2019 - Use a single implementation to all targets and cut off GUI
+            dependency (LCL) and the need of source defines
+            (CONSOLEPASCALSCADA).
+  @author(Fabio Luis Girardi <fabio@pascalscada.com>)
   ***********************************************************************
+
+
 }
 
 {$ENDIF}
@@ -23,18 +30,7 @@ unit Tag;
 interface
 
 uses
-  SysUtils, Classes
-
-  {$IFDEF FPC}
-
-    {$IFNDEF CONSOLEPASCALSCADA}
-       ,LCLIntf, LCLType, Interfaces, Forms
-    {$ENDIF}
-
-  {$ELSE}
-  ,Windows, Messages
-  {$ENDIF}
-  ;
+  SysUtils, Classes, crossthreads, MessageSpool, CrossEvent;
 
 {$IFNDEF FPC}
 const
@@ -366,37 +362,29 @@ type
   PtrInt = LongInt;
   {$ENDIF}
 
+  TDelayedAsyncCaller = Class(TpSCADACoreAffinityThreadWithLoop)
+  private
+    msgQueue:TThreadList;
+    aSomethingToDoEvt:TCrossEvent;
+  protected
+    procedure Loop; override;
+  public
+    constructor Create(CreateSuspended: Boolean; const StackSize: SizeUInt=
+                       DefaultStackSize);
+    destructor Destroy; override;
+    procedure QueueAsyncCall(aProc: TThreadMethod);
+    procedure RemoveAllHandlesOfObj(anObject:TObject);
+  end;
+
   {$IFDEF PORTUGUES}
   //: Classe base para todos os tags.
   {$ELSE}
   //: Base class for all tags.
   {$ENDIF}
-
-  { TTag }
-
   TTag = class(TComponent)
   private
-    {$IFDEF FPC}
-      {$IFDEF CONSOLEPASCALSCADA}
-        FUserData:Pointer;
-      {$ENDIF}
-    {$ENDIF}
-
-    {$IFNDEF FPC}
-      fHandle:HWND;
-         {$IFDEF PORTUGUES}
-         //: Processa as mensagens do tag.
-         {$ELSE}
-         //: Processes the tag messages.
-         {$ENDIF}
-      procedure wndMethod(var Msg:TLMessage); virtual;
-    {$ELSE}
-      {$IFNDEF CONSOLEPASCALSCADA}
-        procedure ASyncMethod(Data: PtrInt); virtual;
-      {$ELSE}
-        procedure ASyncMethod(); virtual;
-      {$ENDIF}
-    {$ENDIF}
+    FQueuedData:TList;
+    procedure ASyncMethod(); virtual;
   protected
     FReadOKNotificationList,
     FReadFaultNotificationList,
@@ -945,9 +933,13 @@ type
 
   TArrayOfScanUpdateRec = array of TScanUpdateRec;
 
-  function TagSizeInBits(const TagType:TTagType; const pttDefaultSize:Integer):Integer;
+  function  TagSizeInBits(const TagType:TTagType; const pttDefaultSize:Integer):Integer;
+  procedure QueueAsyncCall(aProc:TThreadMethod);
+  procedure RemoveAllDelayedCallsOfObj(anObject:TObject);
 
 implementation
+
+uses syncobjs;
 
 function TagSizeInBits(const TagType: TTagType; const pttDefaultSize: Integer
   ): Integer;
@@ -964,11 +956,85 @@ begin
   Result:=SizeInBits[TagType];
 end;
 
+{ TDelayedAsyncCaller }
+
+procedure TDelayedAsyncCaller.Loop;
+var
+  aList: TList;
+  aProc: Pointer;
+begin
+  if aSomethingToDoEvt.WaitFor(1000)=wrSignaled then begin
+    aList := msgQueue.LockList;
+    try
+      while aList.Count>0 do begin;
+        aProc:=aList.First;
+        aList.Remove(aProc);
+        Queue(TThreadMethod(aProc^));
+        Dispose(PMethod(aProc));
+      end;
+      while not aSomethingToDoEvt.ResetEvent do;
+    finally
+      msgQueue.UnlockList;
+    end;
+  end;
+end;
+
+constructor TDelayedAsyncCaller.Create(CreateSuspended: Boolean;
+  const StackSize: SizeUInt);
+begin
+  inherited Create(CreateSuspended, StackSize);
+  msgQueue:=TThreadList.Create;
+  msgQueue.Duplicates:=dupAccept;
+  aSomethingToDoEvt:=TCrossEvent.Create(True, False);
+end;
+
+destructor TDelayedAsyncCaller.Destroy;
+begin
+  Terminate;
+  FreeAndNil(aSomethingToDoEvt);
+  WaitForLoopTerminates;
+  FreeAndNil(msgQueue);
+  RemoveQueuedEvents(Self);
+  inherited Destroy;
+end;
+
+procedure TDelayedAsyncCaller.QueueAsyncCall(aProc: TThreadMethod);
+var
+  arec:PMethod;
+begin
+  if Assigned(msgQueue) then begin
+    New(arec);
+    arec^:=TMethod(aProc);
+    msgQueue.Add(arec);
+  end;
+  while not aSomethingToDoEvt.SetEvent do;
+end;
+
+procedure TDelayedAsyncCaller.RemoveAllHandlesOfObj(anObject: TObject);
+var
+  aList: TList;
+  aProc: Pointer;
+  i: Integer;
+begin
+  aList := msgQueue.LockList;
+  try
+    for i:=aList.Count-1 downto 0 do begin;
+      aProc:=aList.Items[i];
+      if TObject(TMethod(aProc^).Data)=anObject then
+        aList.Delete(i);
+    end;
+  finally
+    msgQueue.UnlockList;
+  end;
+end;
+
 constructor TTag.Create(AOwner:TComponent);
 var
   x:TGuid;
 begin
   inherited Create(AOwner);
+
+  FQueuedData:=TList.Create;
 
   PCommReadErrors := 0;
   PCommReadOK := 0;
@@ -997,9 +1063,12 @@ begin
   SetLength(FChangeNotificationList,0);
   SetLength(FTagRemovalNotificationList,0);
 
-  {$IFNDEF CONSOLEPASCALSCADA}
-  Application.RemoveAsyncCalls(Self);
-  {$ENDIF}
+  RemoveAllHandlersFromObject(Self);
+  for c:=FQueuedData.Count-1 downto 0 do begin
+    ReleaseChangeData(FQueuedData.Items[c]);
+    FQueuedData.Delete(c);
+  end;
+  FreeAndNil(FQueuedData);
 
   inherited Destroy;
 end;
@@ -1129,9 +1198,6 @@ end;
 procedure TTag.NotifyChange;
 var
   c:LongInt;
-{$IFNDEF CONSOLEPASCALSCADA}
-  x:Pointer;
-{$ENDIF}
 begin
   //notifica a mudanca antes de notificar os
   //demais controles.
@@ -1153,65 +1219,26 @@ begin
   if Assigned(POnValueChangeLast) then
     POnValueChangeLast(Self);
 
-  if Assigned(POnAsyncValueChange) then begin
-    {$IFNDEF CONSOLEPASCALSCADA}
-    x:=GetValueChangeData;
-    {$ELSE}
-    FUserData:=GetValueChangeData;
-    {$ENDIF}
-
-
-    {$IFDEF FPC}
-      {$IFNDEF CONSOLEPASCALSCADA}
-      if (Application.Flags*[AppDoNotCallAsyncQueue]=[]) then
-        Application.QueueAsyncCall(@ASyncMethod,PtrInt(x));
-      {$ELSE}
-      TThread.Queue(nil, @ASyncMethod);
-      {$ENDIF}
-    {$ELSE}
-      PostMessage(fHandle,PM_ASYNCVALUECHANGE,PtrInt(x),0);
-    {$ENDIF}
+  if Assigned(POnAsyncValueChange) and Assigned(FQueuedData) then begin
+    FQueuedData.Add(GetValueChangeData);
+    QueueAsyncCall(@ASyncMethod);
   end;
 end;
 
-{$IFNDEF FPC}
-procedure TTag.wndMethod(var Msg: TLMessage);
+procedure TTag.ASyncMethod();
 var
-  handled:Boolean;
-  FData:Pointer;
+  FUserData: Pointer;
 begin
-  handled:=true;
-  case Msg.msg of
-    PM_ASYNCVALUECHANGE: begin
-      FData:=Pointer(Msg.wParam);
-      AsyncNotifyChange(FData);
-      ReleaseChangeData(FData);
-    end
-    else
-      handled:=false;
-  end;
-
-  if handled then
-    msg.Result:=0
-  else
-    inherited Dispatch(Msg);
-end;
-{$ELSE}
-  {$IFNDEF CONSOLEPASCALSCADA}
-    procedure TTag.ASyncMethod(Data: PtrInt);
-    begin
-      AsyncNotifyChange(Pointer(Data));
-      ReleaseChangeData(Pointer(Data));
-    end;
-  {$ELSE}
-    procedure TTag.ASyncMethod();
-    begin
+  if assigned(FQueuedData) and (FQueuedData.Count>0) then begin
+    FUserData:=FQueuedData.First;
+    try
+      FQueuedData.Remove(FUserData);
       AsyncNotifyChange(Pointer(FUserData));
+    finally
       ReleaseChangeData(Pointer(FUserData));
     end;
-  {$ENDIF}
-
-{$ENDIF}
+  end;
+end;
 
 procedure TTag.AsyncNotifyChange(data:Pointer);
 begin
@@ -1308,5 +1335,26 @@ begin
   if value>0 then
     NotifyWriteFault;
 end;
+
+var
+  DelayedAsyncThread:TDelayedAsyncCaller;
+
+procedure QueueAsyncCall(aProc:TThreadMethod);
+begin
+  DelayedAsyncThread.QueueAsyncCall(aProc);
+end;
+
+procedure RemoveAllDelayedCallsOfObj(anObject:TObject);
+begin
+  DelayedAsyncThread.RemoveAllHandlesOfObj(anObject);
+end;
+
+initialization
+  DelayedAsyncThread:=TDelayedAsyncCaller.Create(true);
+  DelayedAsyncThread.Start;
+
+finalization
+  DelayedAsyncThread.Terminate;
+  FreeAndNil(DelayedAsyncThread);
 
 end.
